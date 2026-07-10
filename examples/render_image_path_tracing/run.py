@@ -22,6 +22,7 @@ os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")  # enable cv2's EXR codec
 import cv2
 import spear
 import numpy as np
+from spear.utils import color_utils
 
 _NUM_EXTRA_SETTLE_FRAMES = 4
 
@@ -41,6 +42,9 @@ if __name__ == "__main__":
         print("Error: The --denoiser flag is not compatible with --manual-accumulate. Specify one or the other.")
         exit(1)
 
+    spear.register_log_func(color_utils.log_func)
+    spear.set_default_log_enabled(False)
+
     # create instance
     config = spear.get_config(user_config_files=[os.path.realpath(os.path.join(os.path.dirname(__file__), "user_config.yaml"))])
 
@@ -50,7 +54,7 @@ if __name__ == "__main__":
 
     is_hdr = str.endswith(args.out, ".exr")
 
-    spear.log("Info: Starting ...")
+    spear.log(color_utils.colorize("Starting ...", "green"))
 
 
     # Initialize
@@ -115,7 +119,7 @@ if __name__ == "__main__":
         # Works even when the scene invalidates the engine's own accumulation every frame (e.g. animated content)
         accumulator = None
         for i in range(args.samples):
-            spear.log(f"Info: Path tracing sample {i + 1}/{args.samples} ...")
+            spear.log(color_utils.colorize(f"Path tracing sample {i + 1}/{args.samples} ...", "green"))
             with instance.begin_frame():
                 kismet_rendering_library = game.get_unreal_object(uclass="UKismetRenderingLibrary")
                 kismet_rendering_library.RefreshPathTracingOutput() # reset accumulation before this frame renders
@@ -127,7 +131,7 @@ if __name__ == "__main__":
     else:
         # Accumulate one path-traced sample per pixel per frame; r.PathTracing.SamplesPerPixel caps this at args.samples.
         for i in range(0, args.samples):
-            spear.log(f"Info: Path tracing sample {i + 1}/{args.samples} ...")
+            spear.log(color_utils.colorize(f"Path tracing sample {i + 1}/{args.samples} ...", "green"))
             instance.step()
 
         # Wait for the final pass and possibly the denoiser
@@ -142,7 +146,7 @@ if __name__ == "__main__":
 
     # Save render
 
-    spear.log("Info: Saving image: ", args.out)
+    spear.log("Saving image: ", args.out)
     linear_bgr = final_pixels[:,:,[2,1,0]].astype(np.float32) # RGBA float -> BGR float32 (linear HDR)
     if is_hdr:
         cv2.imwrite(args.out, linear_bgr)
@@ -167,4 +171,4 @@ if __name__ == "__main__":
 
     instance.close()
 
-    spear.log("Info: Done.")
+    spear.log(color_utils.colorize("Done.", "green"))
