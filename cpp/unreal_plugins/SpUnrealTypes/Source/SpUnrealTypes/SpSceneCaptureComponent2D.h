@@ -130,31 +130,13 @@ struct FSpUserSceneTextureMaterialDesc
     int32 ResolutionDivisorHeight = 1;
 };
 
-UENUM(BlueprintType)
-enum class ESpDirectTextureSource : uint8
-{
-    Invalid = 0,
-    SceneColor,
-    SceneDepth,
-    GBufferA,          // world normal (encoded)
-    GBufferB,          // metallic / specular / roughness (+ shading model id in alpha)
-    GBufferC,          // base color (encoded) + AO
-    GBufferD,          // custom data (shading-model dependent)
-    GBufferE,          // precomputed shadow factors
-    GBufferF,          // anisotropy / tangent (when enabled)
-    GBufferVelocity,
-    ScreenSpaceAO,
-};
-
 USTRUCT(BlueprintType)
 struct FSpDirectTextureReadbackDesc
 {
     GENERATED_BODY()
 
-    // Where the readback pixels come from. Invalid (the default) means "run Material"; any scene-texture value
-    // copies that texture instead. Exactly one applies: Source==Invalid with Material set, or Source!=Invalid.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SPEAR")
-    ESpDirectTextureSource Source = ESpDirectTextureSource::Invalid;
+    FString Name;
 
     // Post-process material (may be a UMaterial or a UMaterialInstance). Used only when Source == Invalid.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SPEAR")
@@ -271,10 +253,7 @@ public:
     TArray<FString> UserSceneTextureNames;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SPEAR")
-    TMap<FString, FSpDirectTextureReadbackDesc> DirectTextureReadbackDescs;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SPEAR")
-    TArray<FString> DirectTextureReadbackNames;
+    TArray<FSpDirectTextureReadbackDesc> DirectTextureReadbackDescs;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SPEAR")
     int32 NumOverlappingDirectTextureReadbacks = 0;
@@ -475,6 +454,7 @@ private:
     };
 
     struct DirectTextureReadbackState {
+        std::string name_;
         std::vector<DirectTextureReadbackBuffer> buffers_;
         int32 write_index_ = 0;
         int32 ready_index_ = 0;
@@ -484,9 +464,9 @@ private:
         int32 height_ = 0;
         int32 num_channels_per_pixel_ = 0;
         SpArrayDataType channel_data_type_ = SpArrayDataType::Invalid;
-        ESpDirectTextureSource source_ = ESpDirectTextureSource::Invalid;
         UMaterialInterface* material_ = nullptr;
     };
 
-    std::map<std::string, DirectTextureReadbackState> direct_texture_readback_states_;
+    // Parallel to DirectTextureReadbackDescs (same index/order); built once in Initialize().
+    std::vector<DirectTextureReadbackState> direct_texture_readback_states_;
 };
