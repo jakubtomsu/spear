@@ -34,6 +34,8 @@
 #include <Templates/SharedPointerFwd.h>   // ESPMode
 #include <TextureResource.h>              // FTextureRenderTargetResource
 #include <UObject/ObjectMacros.h>         // GENERATED_BODY, UCLASS, UFUNCTION, UPROPERTY
+#include "PostProcess/PostProcessMaterialInputs.h"
+#include "PostProcess/PostProcessInputs.h"
 
 #include "SpCore/Assert.h"
 #include "SpCore/Boost.h"
@@ -43,6 +45,7 @@
 #include "SpCore/Std.h"
 
 #include "SpUnrealTypes/SpMeshProxyComponentManager.h"
+#include "SpUnrealTypes/SpRHIGlobals.h"
 
 #include "SpSceneCaptureComponent2D.generated.h"
 
@@ -64,12 +67,16 @@ public:
     void SetupViewFamily(FSceneViewFamily& in_view_family) override;
     void SetupView(FSceneViewFamily& in_view_family, FSceneView& in_view) override;
     void BeginRenderViewFamily(FSceneViewFamily& in_view_family) override;
+	void PostRenderBasePassDeferred_RenderThread(FRDGBuilder& GraphBuilder, FSceneView& InView, const FRenderTargetBindingSlots& RenderTargets, TRDGUniformBufferRef<FSceneTextureUniformParameters> SceneTextures) override;
+    void PrePostProcessPass_RenderThread(FRDGBuilder& GraphBuilder, const FSceneView& InView, const FPostProcessingInputs& Inputs) override;
     void PostRenderViewFamily_RenderThread(FRDGBuilder& graph_builder, FSceneViewFamily& in_view_family) override;
 
 protected:
     virtual void setupViewFamily(FSceneViewFamily& view_family) {};
     virtual void setupView(FSceneViewFamily& view_family, FSceneView& view) {};
     virtual void beginRenderViewFamily(FSceneViewFamily& view_family) {};
+	virtual void postRenderBasePassDeferred_RenderThread(FRDGBuilder& GraphBuilder, FSceneView& InView, const FRenderTargetBindingSlots& RenderTargets, TRDGUniformBufferRef<FSceneTextureUniformParameters> SceneTextures) {};
+    virtual void prePostProcessPass_RenderThread(FRDGBuilder& GraphBuilder, const FSceneView& InView, const FPostProcessingInputs& Inputs) {};
     virtual void postRenderViewFamily_RenderThread(FRDGBuilder& graph_builder, FSceneViewFamily& view_family) {};
 
     USpSceneCaptureComponent2D* getComponent() const { SP_ASSERT(component_); return component_; };
@@ -89,6 +96,8 @@ public:
 
 protected:
     void setupView(FSceneViewFamily& view_family, FSceneView& view) override;
+	void postRenderBasePassDeferred_RenderThread(FRDGBuilder& GraphBuilder, FSceneView& InView, const FRenderTargetBindingSlots& RenderTargets, TRDGUniformBufferRef<FSceneTextureUniformParameters> SceneTextures) override;
+    void prePostProcessPass_RenderThread(FRDGBuilder& GraphBuilder, const FSceneView& InView, const FPostProcessingInputs& Inputs) override;
     void postRenderViewFamily_RenderThread(FRDGBuilder& graph_builder, FSceneViewFamily& view_family) override;
 };
 
@@ -122,6 +131,46 @@ struct FSpUserSceneTextureMaterialDesc
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SPEAR")
     int32 ResolutionDivisorHeight = 1;
+};
+
+UENUM(BlueprintType)
+enum class ESpDirectTextureSource : uint8
+{
+    Invalid = 0,
+    SceneColor,
+    SceneDepth,
+    GBufferA,          // world normal (encoded)
+    GBufferB,          // metallic / specular / roughness (+ shading model id in alpha)
+    GBufferC,          // base color (encoded) + AO
+    GBufferD,          // custom data (shading-model dependent)
+    GBufferE,          // precomputed shadow factors
+    GBufferF,          // anisotropy / tangent (when enabled)
+    GBufferVelocity,
+    ScreenSpaceAO,
+};
+
+USTRUCT(BlueprintType)
+struct FSpDirectTextureReadbackDesc
+{
+    GENERATED_BODY()
+
+    // Where the readback pixels come from. Invalid (the default) means "run Material"; any scene-texture value
+    // copies that texture instead. Exactly one applies: Source==Invalid with Material set, or Source!=Invalid.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SPEAR")
+    ESpDirectTextureSource Source = ESpDirectTextureSource::Invalid;
+
+    // Post-process material (may be a UMaterial or a UMaterialInstance). Used only when Source == Invalid.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SPEAR")
+    UMaterialInterface* Material = nullptr;
+
+    // CPU-side interpretation of the readback bytes (numpy shape/dtype). For the material path this also selects
+    // the render target format (see getArrayRenderTargetPixelFormat); for scene-texture sources it must match
+    // the native packing of the source texture, which the copy reproduces byte-for-byte.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SPEAR")
+    int32 NumChannelsPerPixel = 4;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SPEAR")
+    ESpArrayDataType ChannelDataType = ESpArrayDataType::UInt8;
 };
 
 // We need meta=(BlueprintSpawnableComponent) for the component to show up when using the "+Add" button in the editor.
@@ -159,7 +208,9 @@ public:
     // called from FSpSceneViewExtension::setupView(...) to set up the view before rendering
     void setupView(FSceneViewFamily& view_family, FSceneView& view);
 
-    // called from FSpSceneViewExtension::postRenderViewFamily_RenderThread(...) to do post-render work on the render thread
+    // called from FSpSceneViewExtension to do render-stage-specific work on the render thread
+	void postRenderBasePassDeferred_RenderThread(FRDGBuilder& GraphBuilder, FSceneView& InView, const FRenderTargetBindingSlots& RenderTargets, TRDGUniformBufferRef<FSceneTextureUniformParameters> SceneTextures);
+    void prePostProcessPass_RenderThread(FRDGBuilder& GraphBuilder, const FSceneView& InView, const FPostProcessingInputs& Inputs);
     void postRenderViewFamily_RenderThread(FRDGBuilder& graph_builder, FSceneViewFamily& view_family);
 
 private:
@@ -221,6 +272,15 @@ public:
     // Selects which materials are active by populating this array with "public names" (i.e., keys into UserSceneTextureMaterialDescs).
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SPEAR")
     TArray<FString> UserSceneTextureNames;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SPEAR")
+    TMap<FString, FSpDirectTextureReadbackDesc> DirectTextureReadbackDescs;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SPEAR")
+    TArray<FString> DirectTextureReadbackNames;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SPEAR")
+    int32 NumOverlappingDirectTextureReadbacks = 0;
 
     // When disabled, the main (primary) texture is excluded entirely from the returned data (the "data" entry is
     // omitted), so only the user scene textures are read. Unlike bReadPixelData below (a developer/benchmarking flag
@@ -347,6 +407,10 @@ private:
     void enqueueCopyPixelsTripleBuffered(std::map<std::string, TextureReadbackMinimalDesc>& texture_readback_minimal_descs);
     SpFuncDataBundle readPixelsTripleBuffered();
 
+    void readDirectTextureReadbackBuffers(SpFuncDataBundle& dst_bundle);                                                                                                                                             // game thread: consume this poll's target slot (blocking, via the render command below) and append it
+    void dispatchDirectTextureReadbackPasses_RenderThread(FRDGBuilder& graph_builder, const FSceneView& in_view, FRDGTextureRef scene_color_texture, TRDGUniformBufferRef<FSceneTextureUniformParameters> scene_textures); // render thread (pre-post-process): enqueue this frame's capture into the ring
+    void consumeDirectTextureReadback_RenderThread();                                                                                                                                                             // render thread: for each name, Lock+copy the oldest ring slot into its CPU region and record the result
+
     // game thread helpers
     std::map<std::string, TextureReadbackMinimalDesc> requestUpdateAndGetTextureReadbackMinimalDescs();
     std::pair<FRHIGPUTextureReadback*, FRHIGPUTextureReadback*> requestSwapRHIGPUTextureReadbacks(TextureReadbackDesc& texture_readback_desc); // returns {current, prev}; advances the triple-buffered ring-buffer state
@@ -393,4 +457,32 @@ private:
     boost::circular_buffer<double> previous_time_deltas_;
     std::chrono::time_point<std::chrono::high_resolution_clock> previous_time_point_;
     int frame_index_ = 0;
+
+    struct DirectTextureReadbackBuffer {
+        enum class State {
+            Free,
+            InFlight,
+            Ready,
+        };
+        std::atomic<State> state_ = State::Free;
+        std::unique_ptr<FRHIGPUTextureReadback> readback_;
+        std::unique_ptr<SharedMemoryRegion> shared_region_;
+        SpArraySharedMemoryView shared_view_;
+    };
+
+    struct DirectTextureReadbackState {
+        std::vector<DirectTextureReadbackBuffer> buffers_;
+        int32 write_slot_ = 0;
+        int32 read_slot_ = 0;
+
+        // State loaded from desc in Initialize()
+        int32 width_ = 0;
+        int32 height_ = 0;
+        int32 num_channels_per_pixel_ = 0;
+        SpArrayDataType channel_data_type_ = SpArrayDataType::Invalid;
+        ESpDirectTextureSource source_ = ESpDirectTextureSource::Invalid;
+        UMaterialInterface* material_ = nullptr;
+    };
+
+    std::map<std::string, DirectTextureReadbackState> direct_texture_readback_states_;
 };

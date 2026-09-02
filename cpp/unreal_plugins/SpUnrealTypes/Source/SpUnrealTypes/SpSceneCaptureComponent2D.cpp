@@ -31,6 +31,8 @@
 #include <Templates/SharedPointer.h>     // TSharedPtr
 #include <TextureResource.h>             // FTextureRenderTargetResource
 #include <UObject/UObjectGlobals.h>      // NewObject
+#include "PostProcess/PostProcessMaterialInputs.h"
+#include "PostProcess/PostProcessInputs.h"
 
 // private headers need custom include paths in SpModuleRules.Build.cs
 #include <SceneRendering.h> // FViewFamilyInfo
@@ -48,6 +50,96 @@
 #include "SpUnrealTypes/SpMeshProxyComponentManager.h"
 
 class UMaterialInterface;
+
+// Maps our raw numpy-compatible data type to a render-target-compatible texture.
+// Since our shaders are not writing into integer textures we must use only float or normalized integer formats.
+static EPixelFormat getArrayRenderTargetPixelFormat(int num_channels, SpArrayDataType channel_type)
+{
+    SP_ASSERT(num_channels >= 1);
+    SP_ASSERT(num_channels <= 4);
+    SP_ASSERT(channel_type != SpArrayDataType::Invalid);
+
+    switch (num_channels) {
+    case 1:
+        switch (channel_type) {
+        case SpArrayDataType::UInt8:   return PF_R8;
+        case SpArrayDataType::UInt16:  return PF_G16;
+        case SpArrayDataType::Float16: return PF_R16F;
+        case SpArrayDataType::Float32: return PF_R32_FLOAT;
+        }
+        break;
+
+    case 2:
+        switch (channel_type) {
+        case SpArrayDataType::UInt8:   return PF_R8G8;
+        case SpArrayDataType::UInt16:  return PF_G16R16;
+        case SpArrayDataType::Int16:   return PF_G16R16_SNORM;
+        case SpArrayDataType::Float16: return PF_G16R16F;
+        case SpArrayDataType::Float32: return PF_G32R32F;
+        }
+        break;
+
+    case 3:
+        switch (channel_type) {
+        case SpArrayDataType::Float32: return PF_R32G32B32F;
+        }
+        break;
+
+    case 4:
+        switch (channel_type) {
+        case SpArrayDataType::UInt8:   return PF_R8G8B8A8;
+        case SpArrayDataType::Int8:    return PF_R8G8B8A8_SNORM;
+        case SpArrayDataType::UInt16:  return PF_R16G16B16A16_UNORM;
+        case SpArrayDataType::Int16:   return PF_R16G16B16A16_SNORM;
+        case SpArrayDataType::Float16: return PF_FloatRGBA;
+        case SpArrayDataType::Float32: return PF_A32B32G32R32F;
+        }
+        break;
+    }
+
+    // Pixel format matching the channel count and type combination was not found. That's because
+    // not all layouts are always supported by the GPU/RHI.
+    // As a good reference for the existing underlying formats, see:
+    // - Source\Runtime\VulkanRHI\Private\VulkanDevice.cpp\FVulkanDevice::SetupFormats()
+    // - https://docs.vulkan.org/refpages/latest/refpages/source/VkFormat.html
+    return PF_Unknown;
+}
+
+static void memcpyMappedLinearTextures(void* dst_ptr, const void* src_ptr, size_t num_rows, size_t dst_row_bytes, size_t src_row_bytes)
+{
+    SP_ASSERT(dst_ptr);
+    SP_ASSERT(src_ptr);
+    SP_ASSERT(src_row_bytes >= dst_row_bytes); // source stride must cover at least the copied row payload
+
+    if (src_row_bytes == dst_row_bytes) {
+        std::memcpy(dst_ptr, src_ptr, num_rows*dst_row_bytes);
+    } else {
+        uint8_t* dst = static_cast<uint8_t*>(dst_ptr);
+        const uint8_t* src = static_cast<const uint8_t*>(src_ptr);
+        for (size_t y = 0; y < num_rows; y++) {
+            std::memcpy(dst + y*dst_row_bytes, src + y*src_row_bytes, dst_row_bytes);
+        }
+    }
+}
+
+static FRDGTextureRef getDirectSceneTexture(ESpDirectTextureSource source, const FSceneTextureUniformParameters* scene_texture_parameters)
+{
+    SP_ASSERT(scene_texture_parameters);
+    SP_ASSERT(source != ESpDirectTextureSource::Invalid);
+    switch (source) {
+    case ESpDirectTextureSource::SceneColor:      return scene_texture_parameters->SceneColorTexture;
+    case ESpDirectTextureSource::SceneDepth:      return scene_texture_parameters->SceneDepthTexture;
+    case ESpDirectTextureSource::GBufferA:        return scene_texture_parameters->GBufferATexture;
+    case ESpDirectTextureSource::GBufferB:        return scene_texture_parameters->GBufferBTexture;
+    case ESpDirectTextureSource::GBufferC:        return scene_texture_parameters->GBufferCTexture;
+    case ESpDirectTextureSource::GBufferD:        return scene_texture_parameters->GBufferDTexture;
+    case ESpDirectTextureSource::GBufferE:        return scene_texture_parameters->GBufferETexture;
+    case ESpDirectTextureSource::GBufferF:        return scene_texture_parameters->GBufferFTexture;
+    case ESpDirectTextureSource::GBufferVelocity: return scene_texture_parameters->GBufferVelocityTexture;
+    case ESpDirectTextureSource::ScreenSpaceAO:   return scene_texture_parameters->ScreenSpaceAOTexture;
+    }
+    return nullptr;
+}
 
 FSpSceneViewExtensionBase::FSpSceneViewExtensionBase(const FAutoRegister& auto_register) : FSceneViewExtensionBase(auto_register)
 {
@@ -84,6 +176,12 @@ void FSpSceneViewExtensionBase::BeginRenderViewFamily(FSceneViewFamily& in_view_
 {
     if (shouldHandleViewFamily(&in_view_family)) {
         beginRenderViewFamily(in_view_family);
+    }
+}
+
+void FSpSceneViewExtensionBase::PrePostProcessPass_RenderThread(FRDGBuilder& graph_builder, const FSceneView& in_view, const FPostProcessingInputs& inputs) {
+    if (shouldHandleView(in_view.Family, &in_view)) {
+        prePostProcessPass_RenderThread(graph_builder, in_view, inputs);
     }
 }
 
@@ -158,6 +256,11 @@ FSpSceneViewExtension::~FSpSceneViewExtension()
 void FSpSceneViewExtension::setupView(FSceneViewFamily& view_family, FSceneView& view)
 {
     getComponent()->setupView(view_family, view);
+}
+
+void FSpSceneViewExtension::prePostProcessPass_RenderThread(FRDGBuilder& graph_builder, const FSceneView& in_view, const FPostProcessingInputs& inputs)
+{
+    getComponent()->prePostProcessPass_RenderThread(graph_builder, in_view, inputs);
 }
 
 void FSpSceneViewExtension::postRenderViewFamily_RenderThread(FRDGBuilder& graph_builder, FSceneViewFamily& view_family)
@@ -237,13 +340,60 @@ void USpSceneCaptureComponent2D::Initialize()
         }
     }
 
-    if (BufferingMode == ESpBufferingMode::DoubleBuffered || UserSceneTextureNames.Num() > 0 || showFlagsNeedSceneViewExtension()) {
+    if (BufferingMode == ESpBufferingMode::DoubleBuffered || UserSceneTextureNames.Num() > 0 || DirectTextureReadbackNames.Num() > 0 || showFlagsNeedSceneViewExtension()) {
         bAlwaysPersistRenderingState = true; // ensure that the underlying view-state data is stable across frames so FSpSceneViewExtensionBase can match view-state data to this component
         scene_view_extension_ = FSceneViewExtensions::NewExtension<FSpSceneViewExtension>();
         scene_view_extension_->initialize(this);
     }
 
     // allocate memory
+
+    if (DirectTextureReadbackNames.Num() > 0) {
+        SP_ASSERT(bUseSharedMemory);
+        SP_ASSERT(NumOverlappingDirectTextureReadbacks >= 0);
+    }
+
+    for (const FString& name : DirectTextureReadbackNames) {
+        SP_ASSERT(DirectTextureReadbackDescs.Contains(name));
+        const FSpDirectTextureReadbackDesc& desc = DirectTextureReadbackDescs[name];
+        std::string name_string = Unreal::toStdString(name);
+
+        // exactly one path: the material path (Source==Invalid, Material set) or a scene-texture source (no material)
+        if (desc.Source == ESpDirectTextureSource::Invalid) {
+            SP_ASSERT(desc.Material);
+        } else {
+            SP_ASSERT(!desc.Material);
+        }
+
+        DirectTextureReadbackState state;
+        state.source_ = desc.Source;
+        state.material_ = desc.Material;
+        state.width_ = Width;
+        state.height_ = Height;
+        state.num_channels_per_pixel_ = desc.NumChannelsPerPixel;
+        state.channel_data_type_ = Unreal::getEnumValueAs<SpArrayDataType, ESpArrayDataType>(desc.ChannelDataType);
+        
+        if (desc.Source == ESpDirectTextureSource::Invalid) {
+            state.render_target_pixel_format_ = getArrayRenderTargetPixelFormat(state.num_channels_per_pixel_, desc.ChannelDataType);
+            SP_ASSERT(state.render_target_pixel_format_ != PF_Unknown); // no renderable format for this (channels, dtype); see getArrayRenderTargetPixelFormat()
+        }
+                
+        uint64_t slot_num_bytes = static_cast<uint64_t>(state.height_)*state.width_*state.num_channels_per_pixel_*SpArrayDataTypeUtils::getSizeOf(state.channel_data_type_);
+
+        state.buffers_.resize(NumOverlappingDirectTextureReadbacks + 1);
+        for (int32 i = 0; i <= NumOverlappingDirectTextureReadbacks; i++) {
+            DirectTextureReadbackBuffer& buffer = state.buffers_.at(i);
+            buffer.state_ = DirectTextureReadbackBuffer::State::Free;
+            buffer.readback_ = std::make_unique<FRHIGPUTextureReadback>(Unreal::toFName("sp_direct_readback_" + name_string + "_" + std::to_string(i)));
+
+            buffer.shared_region_ = std::make_unique<SharedMemoryRegion>(slot_num_bytes);
+            std::string view_name = "smem:sp_direct_" + name_string + "_" + std::to_string(i);
+            buffer.shared_view_ = SpArraySharedMemoryView(buffer.shared_region_->getView(), view_name, SpArraySharedMemoryUsageFlags::ReturnValue);
+            SpFuncComponent->registerSharedMemoryView(buffer.shared_view_); // name needs to be unique per USpFuncComponent
+        }
+
+        direct_texture_readback_states_.try_emplace(name_string, std::move(state)); // move-construct in place (state is non-copyable: nested unique_ptrs)
+    }
 
     {
         SpArrayDataType channel_data_type = Unreal::getEnumValueAs<SpArrayDataType, ESpArrayDataType>(ChannelDataType);
@@ -368,17 +518,19 @@ void USpSceneCaptureComponent2D::Initialize()
     });
 
     SpFuncComponent->registerFunc("read_pixels", [this](SpFuncDataBundle& args) -> SpFuncDataBundle {
+        SpFuncDataBundle result;
         if (BufferingMode == ESpBufferingMode::SingleBuffered) {
             std::map<std::string, TextureReadbackMinimalDesc> texture_readback_minimal_descs = requestUpdateAndGetTextureReadbackMinimalDescs();
-            return readPixelsSingleBuffered(texture_readback_minimal_descs);
+            result = readPixelsSingleBuffered(texture_readback_minimal_descs);
         } else if (BufferingMode == ESpBufferingMode::DoubleBuffered) {
-            return readPixelsDoubleBuffered();
+            result = readPixelsDoubleBuffered();
         } else if (BufferingMode == ESpBufferingMode::TripleBuffered) {
-            return readPixelsTripleBuffered();
+            result = readPixelsTripleBuffered();
         } else {
             SP_ASSERT(false);
-            return SpFuncDataBundle();
         }
+        tryPopDirectTextureReadbackBuffer(result);
+        return result;
     });
 
     request_path_tracer_reset_ = false;
@@ -447,6 +599,17 @@ void USpSceneCaptureComponent2D::Terminate()
         user_scene_texture_readback_descs_.clear();
     }
 
+    // direct texture readbacks
+    if (DirectTextureReadbackNames.Num() > 0) {
+        FlushRenderingCommands(); // no in-flight readback command may reference the resources we are about to free
+        for (auto& [name_string, state] : direct_texture_readback_states_) {
+            for (DirectTextureReadbackBuffer& buffer : state.buffers_) {
+                SpFuncComponent->unregisterSharedMemoryView(buffer.shared_view_);
+            }
+        }
+        direct_texture_readback_states_.clear();
+    }
+
     // de-allocate memory
     if (bUseSharedMemory) {
         SP_ASSERT(texture_readback_desc_.shared_memory_region_);
@@ -457,7 +620,7 @@ void USpSceneCaptureComponent2D::Terminate()
     std::destroy_at(&texture_readback_desc_);
     std::construct_at(&texture_readback_desc_);
 
-    if (BufferingMode == ESpBufferingMode::DoubleBuffered || UserSceneTextureNames.Num() > 0 || showFlagsNeedSceneViewExtension()) {
+    if (BufferingMode == ESpBufferingMode::DoubleBuffered || UserSceneTextureNames.Num() > 0 || DirectTextureReadbackNames.Num() > 0 || showFlagsNeedSceneViewExtension()) {
         SP_ASSERT(scene_view_extension_);
         scene_view_extension_->terminate();
         scene_view_extension_ = nullptr;
@@ -546,6 +709,129 @@ void USpSceneCaptureComponent2D::setupView(FSceneViewFamily& view_family, FScene
 
     if (request_override_is_offline_render_) {
         view.bIsOfflineRender = request_is_offline_render_;
+    }
+}
+
+void USpSceneCaptureComponent2D::prePostProcessPass_RenderThread(FRDGBuilder& graph_builder, const FSceneView& in_view, const FPostProcessingInputs& inputs)
+{
+    SP_ASSERT(inputs.SceneTextures);
+
+    if (DirectTextureReadbackNames.Num() == 0 || !bReadPixelData) {
+        return;
+    }
+
+    for (const FString& name : DirectTextureReadbackNames) {
+        std::string name_string = Unreal::toStdString(name);
+        SP_ASSERT(direct_texture_readback_states_.contains(name_string));
+        DirectTextureReadbackState& state = direct_texture_readback_states_.at(name_string);
+
+        DirectTextureReadbackBuffer& buffer = state.buffers_.at(state.write_slot_);
+        SP_ASSERT(buffer.readback_);
+        SP_ASSERT(buffer.state_ == DirectTextureReadbackBuffer::State::Free); // The consumer must drain
+
+        FRDGTextureRef src_texture = nullptr;
+
+        if (state.source_ == ESpDirectTextureSource::Invalid) {
+            SP_ASSERT(state.material_);
+
+            EPixelFormat pixel_format = getArrayRenderTargetPixelFormat(state.num_channels_per_pixel_, state.channel_type_);
+            SP_ASSERT(pixel_format != PF_Unknown);
+
+            FRDGTextureDesc output_desc = FRDGTextureDesc::Create2D(
+                FIntPoint(state.width_, state.height_), pixel_format,
+                FClearValueBinding::Black, TexCreate_RenderTargetable | TexCreate_ShaderResource);
+            FRDGTextureRef output_texture = graph_builder.CreateTexture(output_desc, TEXT("SpDirectTextureReadbackTemp"));
+
+            FPostProcessMaterialInputs ppm_inputs;
+            ppm_inputs.SetInput(graph_builder, EPostProcessMaterialInput::SceneColor, FScreenPassTexture(inputs.SceneTextures->GetContents()->SceneColorTexture));
+            ppm_inputs.SceneTextures.SceneTextures = scene_textures;
+            ppm_inputs.bAllowSceneColorInputAsOutput = false;
+            ppm_inputs.OverrideOutput = FScreenPassRenderTarget(output_texture, FIntRect(0, 0, state.width_, state.height_), ERenderTargetLoadAction::ENoAction);
+
+            FScreenPassTexture pass_result = AddPostProcessMaterialPass(graph_builder, in_view, ppm_inputs, state.material_);
+            SP_ASSERT(pass_result.IsValid());
+            src_texture = pass_result.Texture;
+        } else {
+            src_texture = getDirectSceneTexture(state.source_, scene_textures->GetContents());
+            SP_ASSERT(src_texture);
+            SP_ASSERT(GPixelFormats[src_texture->Desc.Format].BlockBytes == state.num_channels_per_pixel_*static_cast<int32>(SpArrayDataTypeUtils::getSizeOf(state.channel_data_type_)));
+        }
+
+        SP_ASSERT(src_texture);
+        AddEnqueueCopyPass(graph_builder, buffer.readback_.get(), src_texture);
+
+        buffer.state_ = DirectTextureReadbackBuffer::State::InFlight;
+        state.write_slot_ = (state.write_slot_ + 1) % static_cast<int32>(state.buffers_.size());
+    }
+}
+
+void USpSceneCaptureComponent2D::consumeDirectTextureReadback_RenderThread()
+{
+    for (const FString& name : DirectTextureReadbackNames) {
+        std::string name_string = Unreal::toStdString(name);
+        SP_ASSERT(direct_texture_readback_states_.contains(name_string));
+        DirectTextureReadbackState& state = direct_texture_readback_states_.at(name_string);
+        DirectTextureReadbackBuffer& buffer = state.buffers_.at(state.write_slot_);
+        SP_ASSERT(buffer.readback_);
+
+        if (buffer.state_ != DirectTextureReadbackBuffer::State::InFlight) {
+            continue;
+        }
+
+        size_t bytes_per_pixel = state.num_channels_per_pixel_*SpArrayDataTypeUtils::getSizeOf(state.channel_data_type_);
+
+        int32 row_pitch_in_pixels = 0;
+        void* src_ptr = buffer.readback_->Lock(row_pitch_in_pixels); // blocks until the GPU copy completes
+        SP_ASSERT(src_ptr);
+        SP_ASSERT(row_pitch_in_pixels >= state.width_);
+        memcpyMappedLinearTextures(buffer.shared_view_.data_, src_ptr, static_cast<size_t>(state.height_), state.width_*bytes_per_pixel, row_pitch_in_pixels*bytes_per_pixel);
+        buffer.readback_->Unlock();
+
+        buffer.state_ = DirectTextureReadbackBuffer::State::Ready;
+        state.last_result_valid_ = true;
+        state.read_slot_ = state.write_slot_;
+    }
+}
+
+void USpSceneCaptureComponent2D::readDirectTextureReadbackBuffers(SpFuncDataBundle& dst_bundle)
+{
+    SP_LOG_CURRENT_FUNCTION()
+    SP_ASSERT(IsInitialized());
+
+    if (DirectTextureReadbackNames.Num() == 0) {
+        return;
+    }
+
+    if (bReadPixelData) {
+        ENQUEUE_RENDER_COMMAND(SpConsumeDirectTextureReadbacks)(
+            [this](FRHICommandListImmediate& command_list) {
+                consumeDirectTextureReadback_RenderThread();
+            });
+        FlushRenderingCommands();
+    }
+
+    for (const FString& name : DirectTextureReadbackNames) {
+        std::string name_string = Unreal::toStdString(name);
+        SP_ASSERT(direct_texture_readback_states_.contains(name_string));
+        DirectTextureReadbackState& state = direct_texture_readback_states_.at(name_string);
+        const DirectTextureReadbackBuffer& buffer = state.buffers_.at(state.read_slot_);
+
+        if (buffer.state_ != DirectTextureReadbackBuffer::State::Ready) {
+            continue;
+        }
+
+        SpPackedArray packed_array;
+        packed_array.shape_ = {static_cast<uint64_t>(state.height_), static_cast<uint64_t>(state.width_), static_cast<uint64_t>(state.num_channels_per_pixel_)};
+        packed_array.data_type_ = state.channel_data_type_;
+        packed_array.view_ = buffer.shared_view_.data_;
+        packed_array.data_source_ = SpArrayDataSource::Shared;
+        packed_array.shared_memory_name_ = buffer.shared_view_.name_;
+        packed_array.shared_memory_usage_flags_ = buffer.shared_view_.usage_flags_;
+
+        buffer.state_ = DirectTextureReadbackBuffer::State::Free;
+
+        std::string key = "direct_" + name_string
+        Std::insert(dst_bundle.packed_arrays_, key, std::move(packed_array));
     }
 }
 
