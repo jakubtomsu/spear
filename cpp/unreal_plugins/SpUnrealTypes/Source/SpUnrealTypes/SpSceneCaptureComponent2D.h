@@ -67,7 +67,6 @@ public:
     void SetupViewFamily(FSceneViewFamily& in_view_family) override;
     void SetupView(FSceneViewFamily& in_view_family, FSceneView& in_view) override;
     void BeginRenderViewFamily(FSceneViewFamily& in_view_family) override;
-	void PostRenderBasePassDeferred_RenderThread(FRDGBuilder& GraphBuilder, FSceneView& InView, const FRenderTargetBindingSlots& RenderTargets, TRDGUniformBufferRef<FSceneTextureUniformParameters> SceneTextures) override;
     void PrePostProcessPass_RenderThread(FRDGBuilder& GraphBuilder, const FSceneView& InView, const FPostProcessingInputs& Inputs) override;
     void PostRenderViewFamily_RenderThread(FRDGBuilder& graph_builder, FSceneViewFamily& in_view_family) override;
 
@@ -75,7 +74,6 @@ protected:
     virtual void setupViewFamily(FSceneViewFamily& view_family) {};
     virtual void setupView(FSceneViewFamily& view_family, FSceneView& view) {};
     virtual void beginRenderViewFamily(FSceneViewFamily& view_family) {};
-	virtual void postRenderBasePassDeferred_RenderThread(FRDGBuilder& GraphBuilder, FSceneView& InView, const FRenderTargetBindingSlots& RenderTargets, TRDGUniformBufferRef<FSceneTextureUniformParameters> SceneTextures) {};
     virtual void prePostProcessPass_RenderThread(FRDGBuilder& GraphBuilder, const FSceneView& InView, const FPostProcessingInputs& Inputs) {};
     virtual void postRenderViewFamily_RenderThread(FRDGBuilder& graph_builder, FSceneViewFamily& view_family) {};
 
@@ -96,7 +94,6 @@ public:
 
 protected:
     void setupView(FSceneViewFamily& view_family, FSceneView& view) override;
-	void postRenderBasePassDeferred_RenderThread(FRDGBuilder& GraphBuilder, FSceneView& InView, const FRenderTargetBindingSlots& RenderTargets, TRDGUniformBufferRef<FSceneTextureUniformParameters> SceneTextures) override;
     void prePostProcessPass_RenderThread(FRDGBuilder& GraphBuilder, const FSceneView& InView, const FPostProcessingInputs& Inputs) override;
     void postRenderViewFamily_RenderThread(FRDGBuilder& graph_builder, FSceneViewFamily& view_family) override;
 };
@@ -409,7 +406,6 @@ private:
 
     void readDirectTextureReadbackBuffers(SpFuncDataBundle& dst_bundle);                                                                                                                                             // game thread: consume this poll's target slot (blocking, via the render command below) and append it
     void dispatchDirectTextureReadbackPasses_RenderThread(FRDGBuilder& graph_builder, const FSceneView& in_view, FRDGTextureRef scene_color_texture, TRDGUniformBufferRef<FSceneTextureUniformParameters> scene_textures); // render thread (pre-post-process): enqueue this frame's capture into the ring
-    void consumeDirectTextureReadback_RenderThread();                                                                                                                                                             // render thread: for each name, Lock+copy the oldest ring slot into its CPU region and record the result
 
     // game thread helpers
     std::map<std::string, TextureReadbackMinimalDesc> requestUpdateAndGetTextureReadbackMinimalDescs();
@@ -468,12 +464,20 @@ private:
         std::unique_ptr<FRHIGPUTextureReadback> readback_;
         std::unique_ptr<SharedMemoryRegion> shared_region_;
         SpArraySharedMemoryView shared_view_;
+
+        DirectTextureReadbackBuffer() = default;
+        DirectTextureReadbackBuffer(DirectTextureReadbackBuffer&& other) noexcept
+            : state_(other.state_.load())
+            , readback_(std::move(other.readback_))
+            , shared_region_(std::move(other.shared_region_))
+            , shared_view_(std::move(other.shared_view_))
+        {}
     };
 
     struct DirectTextureReadbackState {
         std::vector<DirectTextureReadbackBuffer> buffers_;
-        int32 write_slot_ = 0;
-        int32 read_slot_ = 0;
+        int32 write_index_ = 0;
+        int32 ready_index_ = 0;
 
         // State loaded from desc in Initialize()
         int32 width_ = 0;
